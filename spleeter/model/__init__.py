@@ -79,11 +79,46 @@ class WaveformInputProvider(InputProvider):
     def get_feed_dict(self, features, waveform, audio_id):
         return {features["audio_id"]: audio_id, features["waveform"]: waveform}
 
+class SpectralInputProvider(InputProvider):
+    def __init__(self, params):
+        super().__init__(params)
+        self.stft_input_name = "{}_stft".format(self.params["mix_name"])
+
+    @property
+    def input_names(self):
+        return ["audio_id", self.stft_input_name]
+
+    def get_input_dict_placeholders(self):
+        features = {
+            self.stft_input_name: placeholder(
+                tf.complex64,
+                shape=(
+                    None,
+                    self.params["frame_length"] // 2 + 1,
+                    self.params["n_channels"],
+                ),
+                name=self.stft_input_name,
+            ),
+            "audio_id": placeholder(tf.string, name="audio_id"),
+        }
+        return features
+
+    def get_feed_dict(self, features, stft, audio_id):
+        return {features["audio_id"]: audio_id, features[self.stft_input_name]: stft}
+
 
 class InputProviderFactory(object):
     @staticmethod
     def get(params):
-        return WaveformInputProvider(params)
+        stft_backend = params["stft_backend"]
+        assert stft_backend in (
+            "tensorflow",
+            "librosa",
+        ), "Unexpected backend {}".format(stft_backend)
+        if stft_backend == "tensorflow":
+            return WaveformInputProvider(params)
+        else:
+            return SpectralInputProvider(params)
 
 
 class EstimatorSpecBuilder(object):
@@ -156,6 +191,9 @@ class EstimatorSpecBuilder(object):
         self._F = params["F"]
         self._frame_length = params["frame_length"]
         self._frame_step = params["frame_step"]
+        
+    def include_stft_computations(self):
+        return self._params["stft_backend"] == "tensorflow"
 
     def _build_model_outputs(self):
         """
@@ -504,7 +542,10 @@ class EstimatorSpecBuilder(object):
         return output_waveform
 
     def _build_outputs(self):
-        self._outputs = self._build_output_waveform(self.masked_stfts)
+        if self.include_stft_computations():
+            self._outputs = self._build_output_waveform(self.masked_stfts)
+        else:
+            self._outputs = self.masked_stfts
 
         if "audio_id" in self._features:
             self._outputs["audio_id"] = self._features["audio_id"]

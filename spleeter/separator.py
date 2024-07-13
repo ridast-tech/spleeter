@@ -24,9 +24,11 @@ from typing import Any, Dict, Generator, List, Optional
 # pylint: disable=import-error
 import numpy as np
 import tensorflow as tf  # type: ignore
+from librosa.core import istft, stft
+from scipy.signal.windows import hann
 
 from . import SpleeterError
-from .audio import Codec
+from .audio import Codec, STFTBackend
 from .audio.adapter import AudioAdapter
 from .audio.convertor import to_stereo
 from .model import EstimatorSpecBuilder, InputProviderFactory, model_fn
@@ -100,6 +102,7 @@ class Separator(object):
         self,
         params_descriptor: str,
         MWF: bool = False,
+        stft_backend: STFTBackend = STFTBackend.TENSORFLOW,
         multiprocess: bool = True,
     ) -> None:
         """
@@ -108,7 +111,7 @@ class Separator(object):
         Parameters:
             params_descriptor (str):
                 Descriptor for TF params to be used.
-            MWF (bool):
+            MWF (bool): 
                 (Optional) `True` if MWF should be used, `False` otherwise.
             multiprocess (bool):
                 (Optional) Enable multi-processing.
@@ -128,6 +131,7 @@ class Separator(object):
         else:
             self._pool = None
         self._tasks: List = []
+        self._params["stft_backend"] = STFTBackend.resolve(stft_backend)
         self._data_generator = DataGenerator()
 
     def _get_prediction_generator(self) -> Generator:
@@ -167,6 +171,53 @@ class Separator(object):
             task.get()
             task.wait(timeout=timeout)
 
+    def _stft(
+        self, data: np.ndarray, inverse: bool = False, length: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        Single entrypoint for both stft and istft. This computes stft and
+        istft with librosa on stereo data. The two channels are processed
+        separately and are concatenated together in the result. The
+        expected input formats are: (n_samples, 2) for stft and (T, F, 2)
+        for istft.
+
+        Parameters:
+            data (numpy.array):
+                Array with either the waveform or the complex spectrogram
+                depending on the parameter inverse
+            inverse (bool):
+                (Optional) Should a stft or an istft be computed.
+            length (Optional[int]):
+
+        Returns:
+            numpy.ndarray:
+                Stereo data as numpy array for the transform. The channels
+                are stored in the last dimension.
+        """
+        assert not (inverse and length is None)
+        data = np.asfortranarray(data)
+        N = self._params["frame_length"]
+        H = self._params["frame_step"]
+        win = hann(N, sym=False)
+        fstft = istft if inverse else stft
+        win_len_arg = {"win_length": None, "length": None} if inverse else {"n_fft": N}
+        n_channels = data.shape[-1]
+        out = []
+        for c in range(n_channels):
+            d = (
+                np.concatenate((np.zeros((N,)), data[:, c], np.zeros((N,))))
+                if not inverse
+                else data[:, :, c].T
+            )
+            s = fstft(d, hop_length=H, window=win, center=False, **win_len_arg)
+            if inverse:
+                s = s[N : N + length]
+            s = np.expand_dims(s.T, 2 - inverse)
+            out.append(s)
+        if len(out) == 1:
+            return out[0]
+        return np.concatenate(out, axis=2 - inverse)
+
     def _get_input_provider(self):
         if self._input_provider is None:
             self._input_provider = InputProviderFactory.get(self._params)
@@ -182,6 +233,41 @@ class Separator(object):
         if self._builder is None:
             self._builder = EstimatorSpecBuilder(self._get_features(), self._params)
         return self._builder
+
+    def _separate_librosa(
+        self, waveform: np.ndarray, audio_descriptor: AudioDescriptor
+    ) -> Dict:
+        """
+        Performs separation with librosa backend for STFT.
+
+        Parameters:
+            waveform (numpy.ndarray):
+                Waveform to be separated (as a numpy array)
+            audio_descriptor (AudioDescriptor):
+        """
+        with self._tf_graph.as_default():
+            out = {}
+            features = self._get_features()
+            # TODO: fix the logic, build sometimes return,
+            #       sometimes set attribute.
+            outputs = self._get_builder().outputs
+            stft = self._stft(waveform)
+            if stft.shape[-1] == 1:
+                stft = np.concatenate([stft, stft], axis=-1)
+            elif stft.shape[-1] > 2:
+                stft = stft[:, :2]
+            sess = self._get_session()
+            outputs = sess.run(
+                outputs,
+                feed_dict=self._get_input_provider().get_feed_dict(
+                    features, stft, audio_descriptor
+                ),
+            )
+            for inst in self._get_builder().instruments:
+                out[inst] = self._stft(
+                    outputs[inst], inverse=True, length=waveform.shape[0]
+                )
+            return out
 
     def _get_session(self):
         if self._session is None:
@@ -238,7 +324,12 @@ class Separator(object):
             Dict:
                 Separated waveforms.
         """
-        return self._separate_tensorflow(waveform, audio_descriptor)
+        backend: str = self._params["stft_backend"]
+        if backend == STFTBackend.TENSORFLOW:
+            return self._separate_tensorflow(waveform, audio_descriptor)
+        elif backend == STFTBackend.LIBROSA:
+            return self._separate_librosa(waveform, audio_descriptor)
+        raise ValueError(f"Unsupported STFT backend {backend}")
 
     def separate_to_file(
         self,
